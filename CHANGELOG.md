@@ -1,5 +1,10 @@
 # 🌯 Changelog
 
+## v1.6.0
+
+* Changes:
+  * Update for Zig `0.16.0` compatibility. (Thanks @gilbertwong96 !)
+
 ## v1.5.0
 
 * Changes:
