@@ -35,11 +35,9 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
-const fs = std.fs;
+const Io = std.Io;
 const log = std.log;
 const mem = std.mem;
-const os = std.os;
-const gzip = std.compress.gzip;
 
 const xz = @cImport(@cInclude("xz.h"));
 
@@ -47,16 +45,18 @@ const MAGIC = "FOILZ";
 const MAX_READ_SIZE = 1000000000;
 
 pub fn pack_directory(arena: Allocator, path: []const u8, archive_path: []const u8) anyerror!void {
+    const io = std.Options.debug_io;
+
     // Open a file for the archive
-    const arch_file = try fs.cwd().createFile(archive_path, .{ .truncate = true });
-    defer arch_file.close();
+    const arch_file = try Io.Dir.cwd().createFile(io, archive_path, .{ .truncate = true });
+    defer arch_file.close(io);
 
     var foilz_write_buf: [1024]u8 = undefined;
-    var foilz_writer = arch_file.writer(&foilz_write_buf);
+    var foilz_writer = arch_file.writer(io, &foilz_write_buf);
     const writer = &foilz_writer.interface;
 
-    var dir = try fs.openDirAbsolute(path, .{ .access_sub_paths = true, .iterate = true });
-    defer dir.close();
+    var dir = try Io.Dir.openDirAbsolute(io, path, .{ .access_sub_paths = true, .iterate = true });
+    defer dir.close(io);
 
     var walker = try dir.walk(arena);
     defer walker.deinit();
@@ -65,7 +65,7 @@ pub fn pack_directory(arena: Allocator, path: []const u8, archive_path: []const 
 
     try writer.writeAll(MAGIC);
 
-    while (try walker.next()) |entry| {
+    while (try walker.next(io)) |entry| {
         if (entry.kind == .file) {
             // Replace some path string data for the tar index name
             // specifically replace: '../_build/prod/rel/' --> ''
@@ -73,18 +73,18 @@ pub fn pack_directory(arena: Allocator, path: []const u8, archive_path: []const 
             const needle = path;
             const replacement = "";
             const replacement_size = mem.replacementSize(u8, entry.path, needle, replacement);
-            var dest_buff: [fs.max_path_bytes]u8 = undefined;
+            var dest_buff: [std.fs.max_path_bytes]u8 = undefined;
             const index = dest_buff[0..replacement_size];
             _ = mem.replace(u8, entry.path, needle, replacement, index);
 
-            const file = try entry.dir.openFile(entry.basename, .{});
-            defer file.close();
+            const file = try entry.dir.openFile(io, entry.basename, .{});
+            defer file.close(io);
 
             var read_buf: [1024]u8 = undefined;
-            var file_reader = file.reader(&read_buf);
+            var file_reader = file.reader(io, &read_buf);
             const reader = &file_reader.interface;
 
-            const stat = try file.stat();
+            const stat = try file.stat(io);
 
             // Write file record to archive
             const name = index;
@@ -94,7 +94,16 @@ pub fn pack_directory(arena: Allocator, path: []const u8, archive_path: []const 
             if (stat.size > 0) {
                 assert(stat.size == try reader.streamRemaining(writer));
             }
-            try writer.writeInt(usize, stat.mode, .little);
+            // On Windows, std.fs.File.Permissions is an enum (no
+            // .toMode() method), and POSIX mode bits don't apply.
+            // Write 0 — the archive is read on the same machine that
+            // wrote it, so the receiver can derive permissions from
+            // its own filesystem.
+            const mode: usize = if (builtin.os.tag == .windows)
+                0
+            else
+                @intCast(stat.permissions.toMode());
+            try writer.writeInt(usize, mode, .little);
 
             count += 1;
 
@@ -103,17 +112,14 @@ pub fn pack_directory(arena: Allocator, path: []const u8, archive_path: []const 
     }
     direct_log("\n", .{});
 
-    // Log success
-
     try writer.writeAll(MAGIC);
     try writer.flush();
 
     log.info("Archived {} files into payload! 📥", .{count});
 }
 
-pub fn unpack_files(arena: Allocator, data: []const u8, dest_path: []const u8, uncompressed_size: u64) !void {
+pub fn unpack_files(io: Io, arena: Allocator, data: []const u8, dest_path: []const u8, uncompressed_size: u64) !void {
     // Decompress the data in the payload
-
     var decompressed: []u8 = try arena.alloc(u8, uncompressed_size);
 
     var xz_buffer: xz.xz_buf = .{
@@ -171,31 +177,26 @@ pub fn unpack_files(arena: Allocator, data: []const u8, dest_path: []const u8, u
 
         //////
         // Write the file
-        const full_file_path = try fs.path.join(arena, &[_][]const u8{ dest_path[0..], file_name });
+        const full_file_path = try std.fs.path.join(arena, &[_][]const u8{ dest_path[0..], file_name });
 
         //////
         // Create any directories needed
-        const dir_name = fs.path.dirname(file_name);
-        if (dir_name != null) try create_dirs(dest_path[0..], dir_name.?, arena);
+        const dir_name = std.fs.path.dirname(file_name);
+        if (dir_name != null) try create_dirs(io, dest_path[0..], dir_name.?, arena);
 
         log.debug("Unpacked File: {s}", .{full_file_path});
 
         //////
         // Write the file to disk!
-
-        // If we're on windows don't try and use file_mode because NTFS doesn't have that!
-        if (builtin.os.tag == .windows) {
-            const file = try fs.createFileAbsolute(full_file_path, .{ .truncate = true });
+        {
+            const file = try Io.Dir.cwd().createFile(io, full_file_path, .{ .truncate = true });
             if (file_len > 0) {
-                try file.writeAll(file_data);
+                try file.writePositionalAll(io, file_data, 0);
             }
-            file.close();
-        } else {
-            const file = try fs.createFileAbsolute(full_file_path, .{ .truncate = true, .mode = @intCast(file_mode) });
-            if (file_len > 0) {
-                try file.writeAll(file_data);
+            if (builtin.os.tag != .windows) {
+                try file.setPermissions(io, Io.File.Permissions.fromMode(@intCast(file_mode)));
             }
-            file.close();
+            file.close(io);
         }
 
         file_count = file_count + 1;
@@ -204,13 +205,13 @@ pub fn unpack_files(arena: Allocator, data: []const u8, dest_path: []const u8, u
     log.debug("Unpacked {} files", .{file_count});
 }
 
-fn create_dirs(dest_path: []const u8, sub_dir_names: []const u8, allocator: Allocator) !void {
-    var iterator = try fs.path.componentIterator(sub_dir_names);
-    var full_dir_path = try fs.path.join(allocator, &[_][]const u8{ dest_path, "" });
+fn create_dirs(io: Io, dest_path: []const u8, sub_dir_names: []const u8, allocator: Allocator) !void {
+    var iterator = std.fs.path.componentIterator(sub_dir_names);
+    var full_dir_path = try std.fs.path.join(allocator, &[_][]const u8{ dest_path, "" });
 
     while (iterator.next()) |sub_dir| {
-        full_dir_path = try fs.path.join(allocator, &[_][]const u8{ full_dir_path, sub_dir.name });
-        fs.makeDirAbsolute(full_dir_path) catch |err| {
+        full_dir_path = try std.fs.path.join(allocator, &[_][]const u8{ full_dir_path, sub_dir.name });
+        Io.Dir.cwd().createDir(io, full_dir_path, .default_dir) catch |err| {
             switch (err) {
                 error.PathAlreadyExists => {
                     log.debug("Directory Exists: {s}", .{full_dir_path});
@@ -225,11 +226,9 @@ fn create_dirs(dest_path: []const u8, sub_dir_names: []const u8, allocator: Allo
 
 // Adapted from `std.log`, but without forcing a newline
 fn direct_log(comptime message: []const u8, args: anytype) void {
-    var buffer: [64]u8 = undefined;
-    const stderr = std.debug.lockStderrWriter(&buffer);
-    defer std.debug.unlockStderrWriter();
-    nosuspend {
-        stderr.print(message, args) catch return;
-        stderr.flush() catch return;
-    }
+    var buf: [64]u8 = undefined;
+    var w = Io.File.stderr().writer(std.Options.debug_io, &buf);
+    const writer = &w.interface;
+    writer.print(message, args) catch return;
+    writer.flush() catch return;
 }
