@@ -29,7 +29,8 @@ defmodule Burrito.Steps.Patch.RecompileNIFs do
           cflags,
           cxxflags,
           nif_env,
-          nif_make_args
+          nif_make_args,
+          context.zig_bin
         )
       end)
     end
@@ -59,7 +60,7 @@ defmodule Burrito.Steps.Patch.RecompileNIFs do
     end)
   end
 
-  defp maybe_recompile_nif({_, _, false}, _, _, _, _, _, _, _), do: :no_nif
+  defp maybe_recompile_nif({_, _, false}, _, _, _, _, _, _, _, _), do: :no_nif
 
   defp maybe_recompile_nif(
          {dep, path, true},
@@ -69,7 +70,8 @@ defmodule Burrito.Steps.Patch.RecompileNIFs do
          extra_cflags,
          extra_cxxflags,
          extra_env,
-         extra_make_args
+         extra_make_args,
+         zig_bin
        ) do
     dep = Atom.to_string(dep)
 
@@ -94,12 +96,12 @@ defmodule Burrito.Steps.Patch.RecompileNIFs do
         env:
           [
             {"MIX_APP_PATH", output_priv_dir},
-            {"RANLIB", "zig ranlib"},
-            {"AR", "zig ar"},
+            {"RANLIB", "#{zig_bin} ranlib"},
+            {"AR", "#{zig_bin} ar"},
             {"CC",
-             "zig cc -target #{cross_target} -O2 -dynamic -shared -Wl,-undefined=dynamic_lookup #{extra_cflags}"},
+             "#{zig_bin} cc -target #{cross_target} -O2 -dynamic -shared -Wl,-undefined=dynamic_lookup #{extra_cflags}"},
             {"CXX",
-             "zig c++ -target #{cross_target} -O2 -dynamic -shared -Wl,-undefined=dynamic_lookup #{extra_cxxflags}"}
+             "#{zig_bin} c++ -target #{cross_target} -O2 -dynamic -shared -Wl,-undefined=dynamic_lookup #{extra_cxxflags}"}
           ] ++ erts_env ++ extra_env,
         into: IO.stream()
       )
