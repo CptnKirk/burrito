@@ -96,12 +96,12 @@ defmodule Burrito.Steps.Patch.RecompileNIFs do
         env:
           [
             {"MIX_APP_PATH", output_priv_dir},
-            {"RANLIB", "#{zig_bin} ranlib"},
-            {"AR", "#{zig_bin} ar"},
+            {"RANLIB", "#{shell_quote(zig_bin)} ranlib"},
+            {"AR", "#{shell_quote(zig_bin)} ar"},
             {"CC",
-             "#{zig_bin} cc -target #{cross_target} -O2 -dynamic -shared -Wl,-undefined=dynamic_lookup #{extra_cflags}"},
+             "#{shell_quote(zig_bin)} cc -target #{cross_target} -O2 -dynamic -shared -Wl,-undefined=dynamic_lookup #{extra_cflags}"},
             {"CXX",
-             "#{zig_bin} c++ -target #{cross_target} -O2 -dynamic -shared -Wl,-undefined=dynamic_lookup #{extra_cxxflags}"}
+             "#{shell_quote(zig_bin)} c++ -target #{cross_target} -O2 -dynamic -shared -Wl,-undefined=dynamic_lookup #{extra_cxxflags}"}
           ] ++ erts_env ++ extra_env,
         into: IO.stream()
       )
@@ -162,5 +162,14 @@ defmodule Burrito.Steps.Patch.RecompileNIFs do
       {"ERL_INTERFACE_LIB_DIR", ei_lib},
       {"ERTS_INCLUDE_DIR", erts_include}
     ]
+  end
+
+  # CC/CXX/AR/RANLIB above are shell command *strings* that `make` hands to
+  # /bin/sh -c -- zig_bin is a resolved filesystem path (the managed Zig cache
+  # dir, or a user-supplied BURRITO_ZIG_PATH), not a fixed literal like the
+  # bare "zig" this used to be, so it can contain spaces or other characters
+  # that would otherwise split into unintended argv words.
+  defp shell_quote(path) do
+    "'" <> String.replace(path, "'", "'\\''") <> "'"
   end
 end

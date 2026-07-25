@@ -3,8 +3,9 @@ defmodule Burrito.Util.ZigResolver do
   Resolves a path to a `zig` executable matching Burrito's pinned version
   (see `Burrito.get_versions/0`), in this order:
 
-    1. `BURRITO_ZIG_PATH` environment variable, if set — an explicit, always-trusted
-       override.
+    1. `BURRITO_ZIG_PATH` environment variable, if set — an explicit override. Still
+       validated (must exist and report the pinned version) so a typo or wrong-version
+       override fails clearly here instead of confusingly deep in a build step.
     2. A previously downloaded, managed copy at the pinned version, if already cached.
     3. The system `zig` on `$PATH`, if its version matches the pinned version exactly —
        this preserves today's behavior unchanged for anyone who already has the right
@@ -22,6 +23,8 @@ defmodule Burrito.Util.ZigResolver do
 
   alias Burrito.Builder.Log
   alias Burrito.Util
+  alias Burrito.Util.Downloader
+  alias Burrito.Util.FileCache
 
   # sha256 checksums for the pinned zig release, one per (os, cpu) Burrito supports
   # building on. Sourced from https://ziglang.org/download/index.json for the
@@ -38,7 +41,7 @@ defmodule Burrito.Util.ZigResolver do
   def resolve do
     expected = Burrito.get_versions().zig
 
-    with :miss <- from_override(),
+    with :miss <- from_override(expected),
          :miss <- from_managed_cache(expected),
          :miss <- from_system_path(expected) do
       download_and_cache(expected)
@@ -55,17 +58,32 @@ defmodule Burrito.Util.ZigResolver do
     _ -> :error
   end
 
-  defp from_override do
+  defp from_override(expected) do
     case System.get_env("BURRITO_ZIG_PATH") do
       nil ->
         :miss
 
       path ->
-        if File.exists?(path) do
-          Log.info(:step, "Using BURRITO_ZIG_PATH override: #{path}")
-          {:ok, path}
-        else
-          {:error, "BURRITO_ZIG_PATH is set to `#{path}`, but no file exists there!"}
+        cond do
+          not File.regular?(path) ->
+            {:error, "BURRITO_ZIG_PATH is set to `#{path}`, but no file exists there!"}
+
+          true ->
+            case zig_version_at(path) do
+              {:ok, ^expected} ->
+                Log.info(:step, "Using BURRITO_ZIG_PATH override: #{path}")
+                {:ok, path}
+
+              {:ok, other} ->
+                {:error,
+                 "BURRITO_ZIG_PATH points at Zig #{other}, but Burrito requires exactly " <>
+                   "#{expected}!"}
+
+              :error ->
+                {:error,
+                 "BURRITO_ZIG_PATH is set to `#{path}`, but it doesn't look like a working " <>
+                   "`zig` binary!"}
+            end
         end
     end
   end
@@ -115,71 +133,101 @@ defmodule Burrito.Util.ZigResolver do
   end
 
   defp fetch_and_install(os, cpu, version, expected_sha256) do
-    {:ok, _} = Application.ensure_all_started(:req)
-
     archive_ext = if os == :windows, do: "zip", else: "tar.xz"
     file_name = "zig-#{cpu}-#{zig_os_name(os)}-#{version}.#{archive_ext}"
     url = "https://ziglang.org/download/#{version}/#{file_name}"
+    cache_key = :crypto.hash(:sha, url) |> Base.encode16()
 
-    Log.info(:step, "Downloading: #{url}")
-
-    resp =
-      case Util.get_proxy() do
-        proxy = %{scheme: scheme, host: host, port: port} when scheme in ["http", "https"] ->
-          Log.info(:step, "Using PROXY: #{proxy}")
-          proxy = {String.to_atom(scheme), host, port, []}
-          Req.get!(url, raw: true, connect_options: [proxy: proxy])
+    archive_bytes =
+      case FileCache.fetch(cache_key) do
+        {:hit, data} ->
+          Log.info(:step, "Found matching cached Zig download, using that")
+          data
 
         _ ->
-          Req.get!(url, raw: true)
+          download(url, cache_key)
       end
 
-    cond do
-      resp.status != 200 ->
-        {:error, "Failed to download Zig from #{url} (got HTTP #{resp.status})"}
-
-      sha256(resp.body) != expected_sha256 ->
-        {:error,
-         "Checksum mismatch for #{file_name}! Expected #{expected_sha256}, got " <>
-           "#{sha256(resp.body)}. Refusing to use this download."}
-
-      true ->
-        install(resp.body, archive_ext, os, version)
+    if sha256(archive_bytes) != expected_sha256 do
+      {:error,
+       "Checksum mismatch for #{file_name}! Expected #{expected_sha256}, got " <>
+         "#{sha256(archive_bytes)}. Refusing to use this download."}
+    else
+      install(archive_bytes, archive_ext, os, version)
     end
   end
 
+  defp download(url, cache_key) do
+    Log.info(:step, "Downloading: #{url}")
+    resp = Downloader.get!(url)
+
+    if resp.status != 200 do
+      raise "Failed to download Zig from #{url} (got HTTP #{resp.status})"
+    end
+
+    FileCache.put_if_not_exist(cache_key, resp.body)
+    resp.body
+  end
+
   defp install(archive_bytes, archive_ext, os, version) do
-    # Extract as a sibling of the final install location, not under System.tmp_dir!() --
-    # that's frequently a separate filesystem (e.g. tmpfs) from the managed cache dir,
-    # and File.rename!/2 (like POSIX rename(2)) cannot cross a device boundary.
     File.mkdir_p!(managed_root())
 
+    # PID + a per-VM unique integer: collision-resistant across concurrent OS
+    # processes too, not just within one BEAM instance (a bare
+    # :erlang.unique_integer/1 is only unique per-VM, so two `mix release`
+    # processes started at the same moment could otherwise pick the same name).
     extract_dir =
-      Path.join(managed_root(), "extract-#{:erlang.unique_integer([:positive])}")
+      Path.join(
+        managed_root(),
+        "extract-#{System.pid()}-#{:erlang.unique_integer([:positive])}"
+      )
 
     File.mkdir_p!(extract_dir)
 
     with :ok <- extract(archive_bytes, archive_ext, extract_dir),
          {:ok, unpacked_dir} <- sole_entry(extract_dir) do
-      install_dir = managed_install_dir(version)
-      File.mkdir_p!(Path.dirname(install_dir))
-      File.rm_rf!(install_dir)
-      File.rename!(unpacked_dir, install_dir)
+      result = place_install(unpacked_dir, version, os)
       File.rm_rf!(extract_dir)
-
-      zig_path = managed_zig_path(version)
-
-      if os != :windows do
-        File.chmod!(zig_path, 0o755)
-      end
-
-      Log.success(:step, "Installed managed Zig #{version}: #{zig_path}")
-      {:ok, zig_path}
+      result
     else
       {:error, reason} ->
         File.rm_rf!(extract_dir)
         {:error, reason}
     end
+  end
+
+  # First writer wins: if a concurrent build already finished installing this
+  # exact version while we were downloading/extracting, don't delete or
+  # overwrite a directory another process may already be executing `zig` out
+  # of -- just adopt the existing install and discard our own extraction.
+  defp place_install(unpacked_dir, version, os) do
+    install_dir = managed_install_dir(version)
+    zig_path = managed_zig_path(version)
+
+    if File.exists?(zig_path) do
+      Log.info(
+        :step,
+        "Managed Zig #{version} was already installed by a concurrent build, using that"
+      )
+    else
+      File.mkdir_p!(Path.dirname(install_dir))
+
+      case File.rename(unpacked_dir, install_dir) do
+        :ok ->
+          if os != :windows, do: File.chmod!(zig_path, 0o755)
+
+        {:error, _reason} ->
+          # Lost a race with a concurrent installer between the check above and
+          # this rename. If the winner's install landed, use it; otherwise this
+          # really is a failure.
+          unless File.exists?(zig_path) do
+            raise "Failed to install Zig #{version} to #{install_dir}"
+          end
+      end
+    end
+
+    Log.success(:step, "Installed managed Zig #{version}: #{zig_path}")
+    {:ok, zig_path}
   end
 
   defp extract(bytes, "tar.xz", dest_dir) do
@@ -213,11 +261,27 @@ defmodule Burrito.Util.ZigResolver do
   # The Zig archive always contains exactly one top-level `zig-<triplet>-<version>/`
   # directory (the compiler binary plus its supporting `lib/` sources) -- find it
   # rather than hardcoding its name, since the compression step wrote other files
-  # (the archive itself) into the same scratch directory.
+  # (the archive itself) into the same scratch directory. Also confirm that entry
+  # actually resolves inside dest_dir: the checksum gate in fetch_and_install/4
+  # already guards against a tampered archive reaching extraction at all, but this
+  # is a cheap second check specifically on the one path our own code goes on to
+  # `File.rename!/2` -- it doesn't (and, short of a dedicated safe-tar-extraction
+  # library, can't after the fact) catch a malicious *nested* member written
+  # outside dest_dir during extraction itself.
   defp sole_entry(dir) do
     case File.ls!(dir) |> Enum.reject(&(&1 in ["archive.tar.xz", "archive.zip"])) do
-      [only] -> {:ok, Path.join(dir, only)}
-      other -> {:error, "Expected exactly one entry in extracted Zig archive, got: #{inspect(other)}"}
+      [only] ->
+        entry_path = Path.join(dir, only)
+        expanded_dir = Path.expand(dir)
+
+        if String.starts_with?(Path.expand(entry_path), expanded_dir <> "/") do
+          {:ok, entry_path}
+        else
+          {:error, "Extracted Zig archive's top-level entry escaped the extraction directory"}
+        end
+
+      other ->
+        {:error, "Expected exactly one entry in extracted Zig archive, got: #{inspect(other)}"}
     end
   end
 
