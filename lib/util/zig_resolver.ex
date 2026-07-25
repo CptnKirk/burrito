@@ -149,8 +149,13 @@ defmodule Burrito.Util.ZigResolver do
   end
 
   defp install(archive_bytes, archive_ext, os, version) do
+    # Extract as a sibling of the final install location, not under System.tmp_dir!() --
+    # that's frequently a separate filesystem (e.g. tmpfs) from the managed cache dir,
+    # and File.rename!/2 (like POSIX rename(2)) cannot cross a device boundary.
+    File.mkdir_p!(managed_root())
+
     extract_dir =
-      Path.join(System.tmp_dir!(), "burrito-zig-extract-#{:erlang.unique_integer([:positive])}")
+      Path.join(managed_root(), "extract-#{:erlang.unique_integer([:positive])}")
 
     File.mkdir_p!(extract_dir)
 
