@@ -164,11 +164,8 @@ defmodule Burrito.Steps.Patch.RecompileNIFs do
     ]
   end
 
-  # CC/CXX/AR/RANLIB above are shell command *strings* that `make` hands to
-  # /bin/sh -c -- zig_bin is a resolved filesystem path (the managed Zig cache
-  # dir, or a user-supplied BURRITO_ZIG_PATH), not a fixed literal like the
-  # bare "zig" this used to be, so it can contain spaces or other characters
-  # that would otherwise split into unintended argv words.
+  # CC/CXX/AR/RANLIB are shell strings `make` passes to /bin/sh -c; zig_bin can
+  # now be a real path (not the fixed literal "zig"), so it needs quoting.
   defp shell_quote(path) do
     "'" <> String.replace(path, "'", "'\\''") <> "'"
   end

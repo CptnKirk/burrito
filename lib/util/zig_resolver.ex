@@ -172,10 +172,7 @@ defmodule Burrito.Util.ZigResolver do
   defp install(archive_bytes, archive_ext, os, version) do
     File.mkdir_p!(managed_root())
 
-    # PID + a per-VM unique integer: collision-resistant across concurrent OS
-    # processes too, not just within one BEAM instance (a bare
-    # :erlang.unique_integer/1 is only unique per-VM, so two `mix release`
-    # processes started at the same moment could otherwise pick the same name).
+    # unique_integer/1 alone is only unique per-VM, not across concurrent OS processes
     extract_dir =
       Path.join(
         managed_root(),
@@ -196,10 +193,7 @@ defmodule Burrito.Util.ZigResolver do
     end
   end
 
-  # First writer wins: if a concurrent build already finished installing this
-  # exact version while we were downloading/extracting, don't delete or
-  # overwrite a directory another process may already be executing `zig` out
-  # of -- just adopt the existing install and discard our own extraction.
+  # first writer wins -- adopt a concurrent build's install rather than clobber it
   defp place_install(unpacked_dir, version, os) do
     install_dir = managed_install_dir(version)
     zig_path = managed_zig_path(version)
@@ -217,9 +211,7 @@ defmodule Burrito.Util.ZigResolver do
           if os != :windows, do: File.chmod!(zig_path, 0o755)
 
         {:error, _reason} ->
-          # Lost a race with a concurrent installer between the check above and
-          # this rename. If the winner's install landed, use it; otherwise this
-          # really is a failure.
+          # lost the race between the check above and this rename
           unless File.exists?(zig_path) do
             raise "Failed to install Zig #{version} to #{install_dir}"
           end
@@ -258,16 +250,7 @@ defmodule Burrito.Util.ZigResolver do
     end
   end
 
-  # The Zig archive always contains exactly one top-level `zig-<triplet>-<version>/`
-  # directory (the compiler binary plus its supporting `lib/` sources) -- find it
-  # rather than hardcoding its name, since the compression step wrote other files
-  # (the archive itself) into the same scratch directory. Also confirm that entry
-  # actually resolves inside dest_dir: the checksum gate in fetch_and_install/4
-  # already guards against a tampered archive reaching extraction at all, but this
-  # is a cheap second check specifically on the one path our own code goes on to
-  # `File.rename!/2` -- it doesn't (and, short of a dedicated safe-tar-extraction
-  # library, can't after the fact) catch a malicious *nested* member written
-  # outside dest_dir during extraction itself.
+  # find the archive's sole top-level dir, and confirm it didn't escape dest_dir
   defp sole_entry(dir) do
     case File.ls!(dir) |> Enum.reject(&(&1 in ["archive.tar.xz", "archive.zip"])) do
       [only] ->
