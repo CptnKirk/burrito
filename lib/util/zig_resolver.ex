@@ -145,7 +145,7 @@ defmodule Burrito.Util.ZigResolver do
           data
 
         _ ->
-          download(url, cache_key)
+          do_download(url, cache_key)
       end
 
     if sha256(archive_bytes) != expected_sha256 do
@@ -157,12 +157,12 @@ defmodule Burrito.Util.ZigResolver do
     end
   end
 
-  defp download(url, cache_key) do
+  defp do_download(url, cache_key) do
     Log.info(:step, "Downloading: #{url}")
     resp = Downloader.get!(url)
 
     if resp.status != 200 do
-      raise "Failed to download Zig from #{url} (got HTTP #{resp.status})"
+      raise "Failed to download Zig from #{url}! (Got #{resp.status}) -- please file an issue! Thanks!"
     end
 
     FileCache.put_if_not_exist(cache_key, resp.body)
